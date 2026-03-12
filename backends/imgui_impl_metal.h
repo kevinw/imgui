@@ -25,7 +25,10 @@
 #ifdef __OBJC__
 
 @class MTLRenderPassDescriptor;
+@class MTL4RenderPassDescriptor;
 @protocol MTLDevice, MTLCommandBuffer, MTLRenderCommandEncoder;
+@protocol MTLSharedEvent;
+@protocol MTL4CommandBuffer, MTL4RenderCommandEncoder, MTL4CommandQueue;
 
 // Follow "Getting Started" link and check examples/ folder to learn about using backends!
 IMGUI_IMPL_API bool ImGui_ImplMetal_Init(id<MTLDevice> device);
@@ -34,6 +37,14 @@ IMGUI_IMPL_API void ImGui_ImplMetal_NewFrame(MTLRenderPassDescriptor* renderPass
 IMGUI_IMPL_API void ImGui_ImplMetal_RenderDrawData(ImDrawData* drawData,
                                                    id<MTLCommandBuffer> commandBuffer,
                                                    id<MTLRenderCommandEncoder> commandEncoder);
+#if defined(__MAC_26_0) || defined(__IPHONE_26_0)
+IMGUI_IMPL_API void ImGui_ImplMetal4_NewFrame(MTL4RenderPassDescriptor* renderPassDescriptor);
+IMGUI_IMPL_API void ImGui_ImplMetal4_RenderDrawData(ImDrawData* drawData,
+                                                    id<MTL4CommandBuffer> commandBuffer,
+                                                    id<MTL4RenderCommandEncoder> commandEncoder);
+IMGUI_IMPL_API void ImGui_ImplMetal4_ConfigureFrameSynchronization(id<MTLSharedEvent> sharedEvent, int maxFramesInFlight);
+IMGUI_IMPL_API void ImGui_ImplMetal4_NotifyFrameSubmitted(id<MTL4CommandQueue> commandQueue);
+#endif
 
 // Called by Init/NewFrame/Shutdown
 IMGUI_IMPL_API bool ImGui_ImplMetal_CreateDeviceObjects(id<MTLDevice> device);
