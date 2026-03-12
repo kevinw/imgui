@@ -70,12 +70,25 @@ static void ImGui_ImplMetal_InvalidateDeviceObjectsForPlatformWindows();
 @property (nonatomic, assign) MTLPixelFormat depthPixelFormat;
 @property (nonatomic, assign) MTLPixelFormat stencilPixelFormat;
 - (instancetype)initWithRenderPassDescriptor:(MTLRenderPassDescriptor*)renderPassDescriptor;
+#if defined(__MAC_26_0) || defined(__IPHONE_26_0)
+- (instancetype)initWithRenderPassDescriptor4:(MTL4RenderPassDescriptor*)renderPassDescriptor;
+#endif
 @end
 
 @interface MetalTexture : NSObject
 @property (nonatomic, strong) id<MTLTexture> metalTexture;
 - (instancetype)initWithTexture:(id<MTLTexture>)metalTexture;
 @end
+
+#if defined(__MAC_26_0) || defined(__IPHONE_26_0)
+@interface MetalFrameResources : NSObject
+@property (nonatomic, strong) id<MTLBuffer> vertexBuffer;
+@property (nonatomic, strong) id<MTLBuffer> indexBuffer;
+@property (nonatomic, strong) id<MTLBuffer> uniformBuffer;
+@property (nonatomic, strong) NSMutableArray<id<MTL4ArgumentTable>>* argumentTables;
+@property (nonatomic, assign) NSUInteger argumentTableCursor;
+@end
+#endif
 
 // A singleton that stores long-lived objects that are needed by the Metal
 // renderer backend. Stores the render pipeline state cache and the default
@@ -86,6 +99,16 @@ static void ImGui_ImplMetal_InvalidateDeviceObjectsForPlatformWindows();
 @property (nonatomic, strong) FramebufferDescriptor*        framebufferDescriptor; // framebuffer descriptor for current frame; transient
 @property (nonatomic, strong) NSMutableDictionary*          renderPipelineStateCache; // pipeline cache; keyed on framebuffer descriptors
 @property (nonatomic, strong) NSMutableArray<MetalBuffer*>* bufferCache;
+#if defined(__MAC_26_0) || defined(__IPHONE_26_0)
+@property (nonatomic, strong) MTL4ArgumentTableDescriptor*  renderArgumentTableDescriptor;
+@property (nonatomic, strong) id<MTLResidencySet>           metal4ResidencySet;
+@property (nonatomic, strong) id<MTLSharedEvent>            metal4SharedEvent;
+@property (nonatomic, strong) NSMutableArray<MetalFrameResources*>* metal4FrameResources;
+@property (nonatomic, assign) NSUInteger                    metal4MaxFramesInFlight;
+@property (nonatomic, assign) NSUInteger                    metal4FrameIndex;
+@property (nonatomic, assign) uint64_t                      metal4FrameNumber;
+@property (nonatomic, assign) BOOL                          metal4CanReuseFrameResources;
+#endif
 @property (nonatomic, assign) double                        lastBufferCachePurge;
 - (MetalBuffer*)dequeueReusableBufferOfLength:(NSUInteger)length device:(id<MTLDevice>)device;
 - (id<MTLRenderPipelineState>)renderPipelineStateForFramebufferDescriptor:(FramebufferDescriptor*)descriptor device:(id<MTLDevice>)device;
@@ -102,6 +125,13 @@ static ImGui_ImplMetal_Data*    ImGui_ImplMetal_GetBackendData()    { return ImG
 static void                     ImGui_ImplMetal_DestroyBackendData(){ IM_DELETE(ImGui_ImplMetal_GetBackendData()); }
 
 static inline CFTimeInterval    GetMachAbsoluteTimeInSeconds()      { return (CFTimeInterval)(double)(clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1e9); }
+
+#if defined(__MAC_26_0) || defined(__IPHONE_26_0)
+static const NSUInteger         MetalArgumentBufferIndex_VertexData = 0;
+static const NSUInteger         MetalArgumentBufferIndex_Uniforms = 1;
+static const NSUInteger         MetalArgumentTextureIndex_FontAtlas = 0;
+static const uint64_t           Metal4FrameWaitTimeoutMS = 1000;
+#endif
 
 #ifdef IMGUI_IMPL_METAL_CPP
 
@@ -188,6 +218,70 @@ void ImGui_ImplMetal_NewFrame(MTLRenderPassDescriptor* renderPassDescriptor)
         ImGui_ImplMetal_CreateDeviceObjects(bd->SharedMetalContext.device);
 }
 
+#if defined(__MAC_26_0) || defined(__IPHONE_26_0)
+void ImGui_ImplMetal4_ConfigureFrameSynchronization(id<MTLSharedEvent> sharedEvent, int maxFramesInFlight)
+{
+    ImGui_ImplMetal_Data* bd = ImGui_ImplMetal_GetBackendData();
+    IM_ASSERT(bd != nil && "Context or backend not initialized! Did you call ImGui_ImplMetal_Init()?");
+    IM_ASSERT(maxFramesInFlight >= 0);
+
+    MetalContext* ctx = bd->SharedMetalContext;
+    ctx.metal4SharedEvent = sharedEvent;
+    ctx.metal4MaxFramesInFlight = (NSUInteger)maxFramesInFlight;
+    ctx.metal4FrameIndex = 0;
+    ctx.metal4FrameNumber = 0;
+    ctx.metal4CanReuseFrameResources = YES;
+    ctx.metal4FrameResources = [NSMutableArray array];
+    for (NSUInteger frame_index = 0; frame_index < ctx.metal4MaxFramesInFlight; frame_index++)
+    {
+        MetalFrameResources* frame_resources = [[MetalFrameResources alloc] init];
+        frame_resources.argumentTables = [NSMutableArray array];
+        frame_resources.argumentTableCursor = 0;
+        [ctx.metal4FrameResources addObject:frame_resources];
+    }
+}
+
+void ImGui_ImplMetal4_NotifyFrameSubmitted(id<MTL4CommandQueue> commandQueue)
+{
+    ImGui_ImplMetal_Data* bd = ImGui_ImplMetal_GetBackendData();
+    IM_ASSERT(bd != nil && "Context or backend not initialized! Did you call ImGui_ImplMetal_Init()?");
+    MetalContext* ctx = bd->SharedMetalContext;
+    if (ctx.metal4SharedEvent == nil || ctx.metal4MaxFramesInFlight == 0)
+        return;
+
+    [commandQueue signalEvent:ctx.metal4SharedEvent value:ctx.metal4FrameNumber];
+}
+
+void ImGui_ImplMetal4_NewFrame(MTL4RenderPassDescriptor* renderPassDescriptor)
+{
+    ImGui_ImplMetal_Data* bd = ImGui_ImplMetal_GetBackendData();
+    IM_ASSERT(bd != nil && "Context or backend not initialized! Did you call ImGui_ImplMetal_Init()?");
+    MetalContext* ctx = bd->SharedMetalContext;
+    if (ctx.metal4SharedEvent != nil && ctx.metal4MaxFramesInFlight > 0)
+    {
+        ctx.metal4FrameNumber += 1;
+        ctx.metal4FrameIndex = (NSUInteger)((ctx.metal4FrameNumber - 1) % ctx.metal4MaxFramesInFlight);
+        ctx.metal4CanReuseFrameResources = YES;
+        if (ctx.metal4FrameNumber > ctx.metal4MaxFramesInFlight)
+        {
+            uint64_t completed_frame = ctx.metal4FrameNumber - ctx.metal4MaxFramesInFlight;
+            BOOL signaled = [ctx.metal4SharedEvent waitUntilSignaledValue:completed_frame timeoutMS:Metal4FrameWaitTimeoutMS];
+            if (!signaled)
+            {
+                NSLog(@"ImGui_ImplMetal4: timed out waiting for frame %llu", completed_frame);
+                ctx.metal4CanReuseFrameResources = NO;
+            }
+        }
+        if (ctx.metal4CanReuseFrameResources && ctx.metal4FrameResources.count == ctx.metal4MaxFramesInFlight)
+            ctx.metal4FrameResources[ctx.metal4FrameIndex].argumentTableCursor = 0;
+    }
+
+    bd->SharedMetalContext.framebufferDescriptor = [[FramebufferDescriptor alloc] initWithRenderPassDescriptor4:renderPassDescriptor];
+    if (bd->SharedMetalContext.depthStencilState == nil)
+        ImGui_ImplMetal_CreateDeviceObjects(bd->SharedMetalContext.device);
+}
+#endif
+
 static void ImGui_ImplMetal_SetupRenderState(ImDrawData* draw_data, id<MTLCommandBuffer> commandBuffer,
     id<MTLRenderCommandEncoder> commandEncoder, id<MTLRenderPipelineState> renderPipelineState,
     MetalBuffer* vertexBuffer, size_t vertexBufferOffset)
@@ -230,6 +324,98 @@ static void ImGui_ImplMetal_SetupRenderState(ImDrawData* draw_data, id<MTLComman
 
     [commandEncoder setVertexBuffer:vertexBuffer.buffer offset:vertexBufferOffset atIndex:0];
 }
+
+#if defined(__MAC_26_0) || defined(__IPHONE_26_0)
+static void ImGui_ImplMetal4_SetupRenderState(ImDrawData* draw_data,
+    id<MTL4RenderCommandEncoder> commandEncoder, id<MTLRenderPipelineState> renderPipelineState)
+{
+    ImGui_ImplMetal_Data* bd = ImGui_ImplMetal_GetBackendData();
+    [commandEncoder setCullMode:MTLCullModeNone];
+    [commandEncoder setDepthStencilState:bd->SharedMetalContext.depthStencilState];
+
+    MTLViewport viewport =
+    {
+        .originX = 0.0,
+        .originY = 0.0,
+        .width = (double)(draw_data->DisplaySize.x * draw_data->FramebufferScale.x),
+        .height = (double)(draw_data->DisplaySize.y * draw_data->FramebufferScale.y),
+        .znear = 0.0,
+        .zfar = 1.0
+    };
+    [commandEncoder setViewport:viewport];
+    [commandEncoder setRenderPipelineState:renderPipelineState];
+}
+
+static void ImGui_ImplMetal4_SetupRenderResources(id<MTL4ArgumentTable> argumentTable,
+    id<MTLBuffer> vertexBuffer, size_t vertexBufferOffset, id<MTLBuffer> uniformBuffer)
+{
+    [argumentTable setAddress:vertexBuffer.gpuAddress + vertexBufferOffset
+              attributeStride:sizeof(ImDrawVert)
+                      atIndex:MetalArgumentBufferIndex_VertexData];
+    [argumentTable setAddress:uniformBuffer.gpuAddress atIndex:MetalArgumentBufferIndex_Uniforms];
+}
+
+static id<MTLBuffer> ImGui_ImplMetal4_EnsureBuffer(id<MTLDevice> device, id<MTLBuffer> buffer, size_t length)
+{
+    if (buffer == nil || buffer.length < length)
+        return [device newBufferWithLength:length options:MTLResourceStorageModeShared];
+    return buffer;
+}
+
+static void ImGui_ImplMetal4_ResidencySetAddAllocation(id<MTLResidencySet> residencySet, id<MTLAllocation> allocation)
+{
+    if (residencySet != nil && allocation != nil && ![residencySet containsAllocation:allocation])
+    {
+        [residencySet addAllocation:allocation];
+        [residencySet commit];
+    }
+}
+
+static void ImGui_ImplMetal4_ResidencySetRemoveAllocation(id<MTLResidencySet> residencySet, id<MTLAllocation> allocation)
+{
+    if (residencySet != nil && allocation != nil && [residencySet containsAllocation:allocation])
+    {
+        [residencySet removeAllocation:allocation];
+        [residencySet commit];
+    }
+}
+
+static id<MTL4ArgumentTable> ImGui_ImplMetal4_NewArgumentTable(id<MTLDevice> device, MTL4ArgumentTableDescriptor* descriptor)
+{
+    if (device == nil || descriptor == nil)
+        return nil;
+    NSError* error = nil;
+    id<MTL4ArgumentTable> argumentTable = [device newArgumentTableWithDescriptor:descriptor error:&error];
+    if (error != nil)
+        NSLog(@"Error: failed to create Metal4 argument table: %@", error);
+    return argumentTable;
+}
+
+static id<MTL4ArgumentTable> ImGui_ImplMetal4_LeaseArgumentTable(MetalContext* ctx, id<MTLDevice> device)
+{
+    if (ctx == nil || ctx.renderArgumentTableDescriptor == nil)
+        return nil;
+
+    if (ctx.metal4CanReuseFrameResources && ctx.metal4SharedEvent != nil && ctx.metal4MaxFramesInFlight > 0 && ctx.metal4FrameResources.count == ctx.metal4MaxFramesInFlight)
+    {
+        MetalFrameResources* frame_resources = ctx.metal4FrameResources[ctx.metal4FrameIndex];
+        if (frame_resources.argumentTables == nil)
+            frame_resources.argumentTables = [NSMutableArray array];
+
+        if (frame_resources.argumentTableCursor >= frame_resources.argumentTables.count)
+        {
+            id<MTL4ArgumentTable> argumentTable = ImGui_ImplMetal4_NewArgumentTable(device, ctx.renderArgumentTableDescriptor);
+            if (argumentTable == nil)
+                return nil;
+            [frame_resources.argumentTables addObject:argumentTable];
+        }
+
+        return frame_resources.argumentTables[frame_resources.argumentTableCursor++];
+    }
+
+    return ImGui_ImplMetal4_NewArgumentTable(device, ctx.renderArgumentTableDescriptor);
+}
+#endif
 
 // Metal Render function.
 void ImGui_ImplMetal_RenderDrawData(ImDrawData* draw_data, id<MTLCommandBuffer> commandBuffer, id<MTLRenderCommandEncoder> commandEncoder)
@@ -350,11 +536,192 @@ void ImGui_ImplMetal_RenderDrawData(ImDrawData* draw_data, id<MTLCommandBuffer> 
     }];
 }
 
+#if defined(__MAC_26_0) || defined(__IPHONE_26_0)
+void ImGui_ImplMetal4_RenderDrawData(ImDrawData* draw_data, id<MTL4CommandBuffer> commandBuffer, id<MTL4RenderCommandEncoder> commandEncoder)
+{
+    ImGui_ImplMetal_Data* bd = ImGui_ImplMetal_GetBackendData();
+    MetalContext* ctx = bd->SharedMetalContext;
+
+    int fb_width = (int)(draw_data->DisplaySize.x * draw_data->FramebufferScale.x);
+    int fb_height = (int)(draw_data->DisplaySize.y * draw_data->FramebufferScale.y);
+    if (fb_width <= 0 || fb_height <= 0 || draw_data->CmdLists.Size == 0)
+        return;
+
+    if (draw_data->Textures != nullptr)
+        for (ImTextureData* tex : *draw_data->Textures)
+            if (tex->Status != ImTextureStatus_OK)
+                ImGui_ImplMetal_UpdateTexture(tex);
+
+    id<MTLRenderPipelineState> renderPipelineState = ctx.renderPipelineStateCache[ctx.framebufferDescriptor];
+    if (renderPipelineState == nil)
+    {
+        renderPipelineState = [ctx renderPipelineStateForFramebufferDescriptor:ctx.framebufferDescriptor device:commandBuffer.device];
+        ctx.renderPipelineStateCache[ctx.framebufferDescriptor] = renderPipelineState;
+    }
+
+    size_t vertexBufferLength = (size_t)draw_data->TotalVtxCount * sizeof(ImDrawVert);
+    size_t indexBufferLength = (size_t)draw_data->TotalIdxCount * sizeof(ImDrawIdx);
+    id<MTLBuffer> vertexBuffer = nil;
+    id<MTLBuffer> indexBuffer = nil;
+    id<MTLBuffer> uniformBuffer = nil;
+    id<MTLResidencySet> transientResidencySet = nil;
+    if (ctx.metal4CanReuseFrameResources && ctx.metal4SharedEvent != nil && ctx.metal4MaxFramesInFlight > 0 && ctx.metal4FrameResources.count == ctx.metal4MaxFramesInFlight)
+    {
+        MetalFrameResources* frame_resources = ctx.metal4FrameResources[ctx.metal4FrameIndex];
+        id<MTLBuffer> oldVertexBuffer = frame_resources.vertexBuffer;
+        id<MTLBuffer> oldIndexBuffer = frame_resources.indexBuffer;
+        id<MTLBuffer> oldUniformBuffer = frame_resources.uniformBuffer;
+        frame_resources.vertexBuffer = ImGui_ImplMetal4_EnsureBuffer(commandBuffer.device, frame_resources.vertexBuffer, vertexBufferLength);
+        frame_resources.indexBuffer = ImGui_ImplMetal4_EnsureBuffer(commandBuffer.device, frame_resources.indexBuffer, indexBufferLength);
+        frame_resources.uniformBuffer = ImGui_ImplMetal4_EnsureBuffer(commandBuffer.device, frame_resources.uniformBuffer, sizeof(float[4][4]));
+        if (oldVertexBuffer != nil && oldVertexBuffer != frame_resources.vertexBuffer)
+            ImGui_ImplMetal4_ResidencySetRemoveAllocation(ctx.metal4ResidencySet, oldVertexBuffer);
+        if (oldIndexBuffer != nil && oldIndexBuffer != frame_resources.indexBuffer)
+            ImGui_ImplMetal4_ResidencySetRemoveAllocation(ctx.metal4ResidencySet, oldIndexBuffer);
+        if (oldUniformBuffer != nil && oldUniformBuffer != frame_resources.uniformBuffer)
+            ImGui_ImplMetal4_ResidencySetRemoveAllocation(ctx.metal4ResidencySet, oldUniformBuffer);
+        vertexBuffer = frame_resources.vertexBuffer;
+        indexBuffer = frame_resources.indexBuffer;
+        uniformBuffer = frame_resources.uniformBuffer;
+        ImGui_ImplMetal4_ResidencySetAddAllocation(ctx.metal4ResidencySet, vertexBuffer);
+        ImGui_ImplMetal4_ResidencySetAddAllocation(ctx.metal4ResidencySet, indexBuffer);
+        ImGui_ImplMetal4_ResidencySetAddAllocation(ctx.metal4ResidencySet, uniformBuffer);
+    }
+    else
+    {
+        vertexBuffer = [commandBuffer.device newBufferWithLength:vertexBufferLength options:MTLResourceStorageModeShared];
+        indexBuffer = [commandBuffer.device newBufferWithLength:indexBufferLength options:MTLResourceStorageModeShared];
+        uniformBuffer = [commandBuffer.device newBufferWithLength:sizeof(float[4][4]) options:MTLResourceStorageModeShared];
+        if ([commandBuffer.device respondsToSelector:@selector(newResidencySetWithDescriptor:error:)])
+        {
+            NSError* error = nil;
+            MTLResidencySetDescriptor* residencyDescriptor = [[MTLResidencySetDescriptor alloc] init];
+            transientResidencySet = [commandBuffer.device newResidencySetWithDescriptor:residencyDescriptor error:&error];
+            if (error != nil)
+                NSLog(@"Error: failed to create transient Metal4 residency set: %@", error);
+            ImGui_ImplMetal4_ResidencySetAddAllocation(transientResidencySet, vertexBuffer);
+            ImGui_ImplMetal4_ResidencySetAddAllocation(transientResidencySet, indexBuffer);
+            ImGui_ImplMetal4_ResidencySetAddAllocation(transientResidencySet, uniformBuffer);
+        }
+    }
+
+    if (ctx.metal4ResidencySet != nil && transientResidencySet != nil)
+    {
+        id<MTLResidencySet> residencySets[2] = { ctx.metal4ResidencySet, transientResidencySet };
+        [commandBuffer useResidencySets:residencySets count:2];
+    }
+    else if (ctx.metal4ResidencySet != nil)
+    {
+        [commandBuffer useResidencySet:ctx.metal4ResidencySet];
+    }
+    else if (transientResidencySet != nil)
+    {
+        [commandBuffer useResidencySet:transientResidencySet];
+    }
+
+    float L = draw_data->DisplayPos.x;
+    float R = draw_data->DisplayPos.x + draw_data->DisplaySize.x;
+    float T = draw_data->DisplayPos.y;
+    float B = draw_data->DisplayPos.y + draw_data->DisplaySize.y;
+    const float N = 0.0f;
+    const float F = 1.0f;
+    const float ortho_projection[4][4] =
+    {
+        { 2.0f/(R-L),   0.0f,           0.0f,   0.0f },
+        { 0.0f,         2.0f/(T-B),     0.0f,   0.0f },
+        { 0.0f,         0.0f,        1/(F-N),   0.0f },
+        { (R+L)/(L-R),  (T+B)/(B-T), N/(F-N),   1.0f },
+    };
+    memcpy(uniformBuffer.contents, ortho_projection, sizeof(ortho_projection));
+
+    ImGui_ImplMetal4_SetupRenderState(draw_data, commandEncoder, renderPipelineState);
+
+    ImVec2 clip_off = draw_data->DisplayPos;
+    ImVec2 clip_scale = draw_data->FramebufferScale;
+
+    size_t vertexBufferOffset = 0;
+    size_t indexBufferOffset = 0;
+    for (const ImDrawList* draw_list : draw_data->CmdLists)
+    {
+        memcpy((char*)vertexBuffer.contents + vertexBufferOffset, draw_list->VtxBuffer.Data, (size_t)draw_list->VtxBuffer.Size * sizeof(ImDrawVert));
+        memcpy((char*)indexBuffer.contents + indexBufferOffset, draw_list->IdxBuffer.Data, (size_t)draw_list->IdxBuffer.Size * sizeof(ImDrawIdx));
+
+        for (int cmd_i = 0; cmd_i < draw_list->CmdBuffer.Size; cmd_i++)
+        {
+            const ImDrawCmd* pcmd = &draw_list->CmdBuffer[cmd_i];
+            if (pcmd->UserCallback)
+            {
+                if (pcmd->UserCallback == ImDrawCallback_ResetRenderState)
+                {
+                    ImGui_ImplMetal4_SetupRenderState(draw_data, commandEncoder, renderPipelineState);
+                }
+                else
+                {
+                    pcmd->UserCallback(draw_list, pcmd);
+                }
+            }
+            else
+            {
+                ImVec2 clip_min((pcmd->ClipRect.x - clip_off.x) * clip_scale.x, (pcmd->ClipRect.y - clip_off.y) * clip_scale.y);
+                ImVec2 clip_max((pcmd->ClipRect.z - clip_off.x) * clip_scale.x, (pcmd->ClipRect.w - clip_off.y) * clip_scale.y);
+
+                if (clip_min.x < 0.0f) { clip_min.x = 0.0f; }
+                if (clip_min.y < 0.0f) { clip_min.y = 0.0f; }
+                if (clip_max.x > fb_width) { clip_max.x = (float)fb_width; }
+                if (clip_max.y > fb_height) { clip_max.y = (float)fb_height; }
+                if (clip_max.x <= clip_min.x || clip_max.y <= clip_min.y)
+                    continue;
+                if (pcmd->ElemCount == 0)
+                    continue;
+
+                id<MTL4ArgumentTable> argumentTable = ImGui_ImplMetal4_LeaseArgumentTable(ctx, commandBuffer.device);
+                if (argumentTable == nil)
+                    continue;
+                ImGui_ImplMetal4_SetupRenderResources(argumentTable, vertexBuffer, vertexBufferOffset + pcmd->VtxOffset * sizeof(ImDrawVert), uniformBuffer);
+
+                MTLScissorRect scissorRect =
+                {
+                    .x = NSUInteger(clip_min.x),
+                    .y = NSUInteger(clip_min.y),
+                    .width = NSUInteger(clip_max.x - clip_min.x),
+                    .height = NSUInteger(clip_max.y - clip_min.y)
+                };
+                [commandEncoder setScissorRect:scissorRect];
+
+                if (ImTextureID tex_id = pcmd->GetTexID())
+                {
+                    id<MTLTexture> texture = (__bridge id<MTLTexture>)(void*)(intptr_t)(tex_id);
+                    [argumentTable setTexture:texture.gpuResourceID atIndex:MetalArgumentTextureIndex_FontAtlas];
+                }
+                else
+                {
+                    [argumentTable setTexture:MTLResourceID{0} atIndex:MetalArgumentTextureIndex_FontAtlas];
+                }
+
+                [commandEncoder setArgumentTable:argumentTable atStages:MTLRenderStageVertex | MTLRenderStageFragment];
+                [commandEncoder drawIndexedPrimitives:MTLPrimitiveTypeTriangle
+                                           indexCount:pcmd->ElemCount
+                                            indexType:sizeof(ImDrawIdx) == 2 ? MTLIndexTypeUInt16 : MTLIndexTypeUInt32
+                                          indexBuffer:indexBuffer.gpuAddress + indexBufferOffset + pcmd->IdxOffset * sizeof(ImDrawIdx)
+                                    indexBufferLength:indexBufferLength - (indexBufferOffset + pcmd->IdxOffset * sizeof(ImDrawIdx))];
+            }
+        }
+
+        vertexBufferOffset += (size_t)draw_list->VtxBuffer.Size * sizeof(ImDrawVert);
+        indexBufferOffset += (size_t)draw_list->IdxBuffer.Size * sizeof(ImDrawIdx);
+    }
+}
+#endif
+
 static void ImGui_ImplMetal_DestroyTexture(ImTextureData* tex)
 {
+    ImGui_ImplMetal_Data* bd = ImGui_ImplMetal_GetBackendData();
     if (MetalTexture* backend_tex = (__bridge_transfer MetalTexture*)(tex->BackendUserData))
     {
         IM_ASSERT(backend_tex.metalTexture == (__bridge id<MTLTexture>)(void*)(intptr_t)tex->TexID);
+#if defined(__MAC_26_0) || defined(__IPHONE_26_0)
+        ImGui_ImplMetal4_ResidencySetRemoveAllocation(bd->SharedMetalContext.metal4ResidencySet, backend_tex.metalTexture);
+#endif
         backend_tex.metalTexture = nil;
 
         // Clear identifiers and mark as destroyed (in order to allow e.g. calling InvalidateDeviceObjects while running)
@@ -391,6 +758,9 @@ void ImGui_ImplMetal_UpdateTexture(ImTextureData* tex)
         id <MTLTexture> texture = [bd->SharedMetalContext.device newTextureWithDescriptor:textureDescriptor];
         [texture replaceRegion:MTLRegionMake2D(0, 0, (NSUInteger)tex->Width, (NSUInteger)tex->Height) mipmapLevel:0 withBytes:tex->Pixels bytesPerRow:(NSUInteger)tex->Width * 4];
         MetalTexture* backend_tex = [[MetalTexture alloc] initWithTexture:texture];
+#if defined(__MAC_26_0) || defined(__IPHONE_26_0)
+        ImGui_ImplMetal4_ResidencySetAddAllocation(bd->SharedMetalContext.metal4ResidencySet, texture);
+#endif
 
         // Store identifiers
         tex->SetTexID((ImTextureID)(intptr_t)texture);
@@ -429,6 +799,28 @@ bool ImGui_ImplMetal_CreateDeviceObjects(id<MTLDevice> device)
     [depthStencilDescriptor release];
 #endif
 
+#if defined(__MAC_26_0) || defined(__IPHONE_26_0)
+    if ([device respondsToSelector:@selector(newArgumentTableWithDescriptor:error:)] && bd->SharedMetalContext.renderArgumentTableDescriptor == nil)
+    {
+        MTL4ArgumentTableDescriptor* argumentTableDescriptor = [[MTL4ArgumentTableDescriptor alloc] init];
+        argumentTableDescriptor.maxBufferBindCount = 2;
+        argumentTableDescriptor.maxTextureBindCount = 1;
+        argumentTableDescriptor.supportAttributeStrides = YES;
+        argumentTableDescriptor.initializeBindings = YES;
+        bd->SharedMetalContext.renderArgumentTableDescriptor = argumentTableDescriptor;
+    }
+
+    if ([device respondsToSelector:@selector(newResidencySetWithDescriptor:error:)] && bd->SharedMetalContext.metal4ResidencySet == nil)
+    {
+        NSError* error = nil;
+        MTLResidencySetDescriptor* residencyDescriptor = [[MTLResidencySetDescriptor alloc] init];
+        residencyDescriptor.label = @"ImGui_ImplMetal4";
+        bd->SharedMetalContext.metal4ResidencySet = [device newResidencySetWithDescriptor:residencyDescriptor error:&error];
+        if (error != nil)
+            NSLog(@"Error: failed to create Metal4 residency set: %@", error);
+    }
+#endif
+
     return true;
 }
 
@@ -443,6 +835,11 @@ void ImGui_ImplMetal_DestroyDeviceObjects()
 
     ImGui_ImplMetal_InvalidateDeviceObjectsForPlatformWindows();
     [bd->SharedMetalContext.renderPipelineStateCache removeAllObjects];
+#if defined(__MAC_26_0) || defined(__IPHONE_26_0)
+    bd->SharedMetalContext.renderArgumentTableDescriptor = nil;
+    bd->SharedMetalContext.metal4ResidencySet = nil;
+    bd->SharedMetalContext.metal4FrameResources = nil;
+#endif
 }
 
 #pragma mark - Multi-viewport support
@@ -618,6 +1015,20 @@ static void ImGui_ImplMetal_InvalidateDeviceObjectsForPlatformWindows()
     return self;
 }
 
+#if defined(__MAC_26_0) || defined(__IPHONE_26_0)
+- (instancetype)initWithRenderPassDescriptor4:(MTL4RenderPassDescriptor*)renderPassDescriptor
+{
+    if ((self = [super init]))
+    {
+        _sampleCount = renderPassDescriptor.colorAttachments[0].texture.sampleCount;
+        _colorPixelFormat = renderPassDescriptor.colorAttachments[0].texture.pixelFormat;
+        _depthPixelFormat = renderPassDescriptor.depthAttachment.texture.pixelFormat;
+        _stencilPixelFormat = renderPassDescriptor.stencilAttachment.texture.pixelFormat;
+    }
+    return self;
+}
+#endif
+
 - (nonnull id)copyWithZone:(nullable NSZone*)zone
 {
     FramebufferDescriptor* copy = [[FramebufferDescriptor allocWithZone:zone] init];
@@ -662,6 +1073,11 @@ static void ImGui_ImplMetal_InvalidateDeviceObjectsForPlatformWindows()
 }
 
 @end
+
+#if defined(__MAC_26_0) || defined(__IPHONE_26_0)
+@implementation MetalFrameResources
+@end
+#endif
 
 #pragma mark - MetalContext implementation
 
