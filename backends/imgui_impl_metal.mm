@@ -350,7 +350,6 @@ static void ImGui_ImplMetal4_SetupRenderResources(id<MTL4ArgumentTable> argument
     id<MTLBuffer> vertexBuffer, size_t vertexBufferOffset, id<MTLBuffer> uniformBuffer)
 {
     [argumentTable setAddress:vertexBuffer.gpuAddress + vertexBufferOffset
-              attributeStride:sizeof(ImDrawVert)
                       atIndex:MetalArgumentBufferIndex_VertexData];
     [argumentTable setAddress:uniformBuffer.gpuAddress atIndex:MetalArgumentBufferIndex_Uniforms];
 }
@@ -448,8 +447,10 @@ void ImGui_ImplMetal_RenderDrawData(ImDrawData* draw_data, id<MTLCommandBuffer> 
         ctx.renderPipelineStateCache[ctx.framebufferDescriptor] = renderPipelineState;
     }
 
-    size_t vertexBufferLength = (size_t)draw_data->TotalVtxCount * sizeof(ImDrawVert);
-    size_t indexBufferLength = (size_t)draw_data->TotalIdxCount * sizeof(ImDrawIdx);
+    // Expand indexed ImGui triangles into a plain vertex stream for Metal4.
+    // This avoids the broken indexed fetch path we were seeing with text quads.
+    size_t vertexBufferLength = (size_t)draw_data->TotalIdxCount * sizeof(ImDrawVert);
+    size_t indexBufferLength = (size_t)draw_data->TotalIdxCount * sizeof(uint32_t);
     MetalBuffer* vertexBuffer = [ctx dequeueReusableBufferOfLength:vertexBufferLength device:commandBuffer.device];
     MetalBuffer* indexBuffer = [ctx dequeueReusableBufferOfLength:indexBufferLength device:commandBuffer.device];
 
@@ -643,9 +644,6 @@ void ImGui_ImplMetal4_RenderDrawData(ImDrawData* draw_data, id<MTL4CommandBuffer
     size_t indexBufferOffset = 0;
     for (const ImDrawList* draw_list : draw_data->CmdLists)
     {
-        memcpy((char*)vertexBuffer.contents + vertexBufferOffset, draw_list->VtxBuffer.Data, (size_t)draw_list->VtxBuffer.Size * sizeof(ImDrawVert));
-        memcpy((char*)indexBuffer.contents + indexBufferOffset, draw_list->IdxBuffer.Data, (size_t)draw_list->IdxBuffer.Size * sizeof(ImDrawIdx));
-
         for (int cmd_i = 0; cmd_i < draw_list->CmdBuffer.Size; cmd_i++)
         {
             const ImDrawCmd* pcmd = &draw_list->CmdBuffer[cmd_i];
@@ -677,7 +675,13 @@ void ImGui_ImplMetal4_RenderDrawData(ImDrawData* draw_data, id<MTL4CommandBuffer
                 id<MTL4ArgumentTable> argumentTable = ImGui_ImplMetal4_LeaseArgumentTable(ctx, commandBuffer.device);
                 if (argumentTable == nil)
                     continue;
-                ImGui_ImplMetal4_SetupRenderResources(argumentTable, vertexBuffer, vertexBufferOffset + pcmd->VtxOffset * sizeof(ImDrawVert), uniformBuffer);
+                ImDrawVert* expanded_vertices = (ImDrawVert*)((char*)vertexBuffer.contents + vertexBufferOffset);
+                const ImDrawVert* source_vertices = draw_list->VtxBuffer.Data;
+                const ImDrawIdx* source_indices = draw_list->IdxBuffer.Data + pcmd->IdxOffset;
+                for (unsigned int idx_n = 0; idx_n < pcmd->ElemCount; idx_n++)
+                    expanded_vertices[idx_n] = source_vertices[source_indices[idx_n]];
+
+                ImGui_ImplMetal4_SetupRenderResources(argumentTable, vertexBuffer, vertexBufferOffset, uniformBuffer);
 
                 MTLScissorRect scissorRect =
                 {
@@ -699,16 +703,13 @@ void ImGui_ImplMetal4_RenderDrawData(ImDrawData* draw_data, id<MTL4CommandBuffer
                 }
 
                 [commandEncoder setArgumentTable:argumentTable atStages:MTLRenderStageVertex | MTLRenderStageFragment];
-                [commandEncoder drawIndexedPrimitives:MTLPrimitiveTypeTriangle
-                                           indexCount:pcmd->ElemCount
-                                            indexType:sizeof(ImDrawIdx) == 2 ? MTLIndexTypeUInt16 : MTLIndexTypeUInt32
-                                          indexBuffer:indexBuffer.gpuAddress + indexBufferOffset + pcmd->IdxOffset * sizeof(ImDrawIdx)
-                                    indexBufferLength:indexBufferLength - (indexBufferOffset + pcmd->IdxOffset * sizeof(ImDrawIdx))];
+                [commandEncoder drawPrimitives:MTLPrimitiveTypeTriangle
+                                   vertexStart:0
+                                   vertexCount:pcmd->ElemCount];
+
+                vertexBufferOffset += (size_t)pcmd->ElemCount * sizeof(ImDrawVert);
             }
         }
-
-        vertexBufferOffset += (size_t)draw_list->VtxBuffer.Size * sizeof(ImDrawVert);
-        indexBufferOffset += (size_t)draw_list->IdxBuffer.Size * sizeof(ImDrawIdx);
     }
 }
 #endif
@@ -805,7 +806,7 @@ bool ImGui_ImplMetal_CreateDeviceObjects(id<MTLDevice> device)
         MTL4ArgumentTableDescriptor* argumentTableDescriptor = [[MTL4ArgumentTableDescriptor alloc] init];
         argumentTableDescriptor.maxBufferBindCount = 2;
         argumentTableDescriptor.maxTextureBindCount = 1;
-        argumentTableDescriptor.supportAttributeStrides = YES;
+        argumentTableDescriptor.supportAttributeStrides = NO;
         argumentTableDescriptor.initializeBindings = YES;
         bd->SharedMetalContext.renderArgumentTableDescriptor = argumentTableDescriptor;
     }
