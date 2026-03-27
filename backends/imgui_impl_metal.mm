@@ -88,6 +88,9 @@
 @property (nonatomic, strong) id<MTLDepthStencilState>      depthStencilState;
 @property (nonatomic, strong) FramebufferDescriptor*        framebufferDescriptor; // framebuffer descriptor for current frame; transient
 @property (nonatomic, strong) NSMutableDictionary*          renderPipelineStateCache; // pipeline cache; keyed on framebuffer descriptors
+#if defined(__MAC_26_0) || defined(__IPHONE_26_0)
+@property (nonatomic, strong) NSMutableDictionary*          metal4RenderPipelineStateCache; // Metal4-specific pipeline cache
+#endif
 @property (nonatomic, strong) NSMutableArray<MetalBuffer*>* bufferCache;
 #if defined(__MAC_26_0) || defined(__IPHONE_26_0)
 @property (nonatomic, strong) MTL4ArgumentTableDescriptor*  renderArgumentTableDescriptor;
@@ -102,6 +105,9 @@
 @property (nonatomic, assign) double                        lastBufferCachePurge;
 - (MetalBuffer*)dequeueReusableBufferOfLength:(NSUInteger)length device:(id<MTLDevice>)device;
 - (id<MTLRenderPipelineState>)renderPipelineStateForFramebufferDescriptor:(FramebufferDescriptor*)descriptor device:(id<MTLDevice>)device;
+#if defined(__MAC_26_0) || defined(__IPHONE_26_0)
+- (id<MTLRenderPipelineState>)renderPipelineStateForFramebufferDescriptor4:(FramebufferDescriptor*)descriptor device:(id<MTLDevice>)device;
+#endif
 @end
 
 struct ImGui_ImplMetal_Data
@@ -119,6 +125,7 @@ static inline CFTimeInterval    GetMachAbsoluteTimeInSeconds()      { return (CF
 #if defined(__MAC_26_0) || defined(__IPHONE_26_0)
 static const NSUInteger         MetalArgumentBufferIndex_VertexData = 0;
 static const NSUInteger         MetalArgumentBufferIndex_Uniforms = 1;
+static const NSUInteger         MetalArgumentBufferIndex_IndexData = 2;
 static const NSUInteger         MetalArgumentTextureIndex_FontAtlas = 0;
 static const uint64_t           Metal4FrameWaitTimeoutMS = 1000;
 #endif
@@ -334,11 +341,14 @@ static void ImGui_ImplMetal4_SetupRenderState(ImDrawData* draw_data,
 }
 
 static void ImGui_ImplMetal4_SetupRenderResources(id<MTL4ArgumentTable> argumentTable,
-    id<MTLBuffer> vertexBuffer, size_t vertexBufferOffset, id<MTLBuffer> uniformBuffer)
+    id<MTLBuffer> vertexBuffer, size_t vertexBufferOffset,
+    id<MTLBuffer> uniformBuffer,
+    id<MTLBuffer> indexBuffer, size_t indexBufferOffset)
 {
     [argumentTable setAddress:vertexBuffer.gpuAddress + vertexBufferOffset
                       atIndex:MetalArgumentBufferIndex_VertexData];
     [argumentTable setAddress:uniformBuffer.gpuAddress atIndex:MetalArgumentBufferIndex_Uniforms];
+    [argumentTable setAddress:indexBuffer.gpuAddress + indexBufferOffset atIndex:MetalArgumentBufferIndex_IndexData];
 }
 
 static id<MTLBuffer> ImGui_ImplMetal4_EnsureBuffer(id<MTLDevice> device, id<MTLBuffer> buffer, size_t length)
@@ -434,10 +444,8 @@ void ImGui_ImplMetal_RenderDrawData(ImDrawData* draw_data, id<MTLCommandBuffer> 
         ctx.renderPipelineStateCache[ctx.framebufferDescriptor] = renderPipelineState;
     }
 
-    // Expand indexed ImGui triangles into a plain vertex stream for Metal4.
-    // This avoids the broken indexed fetch path we were seeing with text quads.
-    size_t vertexBufferLength = (size_t)draw_data->TotalIdxCount * sizeof(ImDrawVert);
-    size_t indexBufferLength = (size_t)draw_data->TotalIdxCount * sizeof(uint32_t);
+    size_t vertexBufferLength = (size_t)draw_data->TotalVtxCount * sizeof(ImDrawVert);
+    size_t indexBufferLength = (size_t)draw_data->TotalIdxCount * sizeof(ImDrawIdx);
     MetalBuffer* vertexBuffer = [ctx dequeueReusableBufferOfLength:vertexBufferLength device:commandBuffer.device];
     MetalBuffer* indexBuffer = [ctx dequeueReusableBufferOfLength:indexBufferLength device:commandBuffer.device];
 
@@ -539,11 +547,11 @@ void ImGui_ImplMetal4_RenderDrawData(ImDrawData* draw_data, id<MTL4CommandBuffer
             if (tex->Status != ImTextureStatus_OK)
                 ImGui_ImplMetal_UpdateTexture(tex);
 
-    id<MTLRenderPipelineState> renderPipelineState = ctx.renderPipelineStateCache[ctx.framebufferDescriptor];
+    id<MTLRenderPipelineState> renderPipelineState = ctx.metal4RenderPipelineStateCache[ctx.framebufferDescriptor];
     if (renderPipelineState == nil)
     {
-        renderPipelineState = [ctx renderPipelineStateForFramebufferDescriptor:ctx.framebufferDescriptor device:commandBuffer.device];
-        ctx.renderPipelineStateCache[ctx.framebufferDescriptor] = renderPipelineState;
+        renderPipelineState = [ctx renderPipelineStateForFramebufferDescriptor4:ctx.framebufferDescriptor device:commandBuffer.device];
+        ctx.metal4RenderPipelineStateCache[ctx.framebufferDescriptor] = renderPipelineState;
     }
 
     size_t vertexBufferLength = (size_t)draw_data->TotalVtxCount * sizeof(ImDrawVert);
@@ -630,6 +638,9 @@ void ImGui_ImplMetal4_RenderDrawData(ImDrawData* draw_data, id<MTL4CommandBuffer
     size_t indexBufferOffset = 0;
     for (const ImDrawList* draw_list : draw_data->CmdLists)
     {
+        memcpy((char*)vertexBuffer.contents + vertexBufferOffset, draw_list->VtxBuffer.Data, (size_t)draw_list->VtxBuffer.Size * sizeof(ImDrawVert));
+        memcpy((char*)indexBuffer.contents + indexBufferOffset, draw_list->IdxBuffer.Data, (size_t)draw_list->IdxBuffer.Size * sizeof(ImDrawIdx));
+
         for (int cmd_i = 0; cmd_i < draw_list->CmdBuffer.Size; cmd_i++)
         {
             const ImDrawCmd* pcmd = &draw_list->CmdBuffer[cmd_i];
@@ -661,13 +672,10 @@ void ImGui_ImplMetal4_RenderDrawData(ImDrawData* draw_data, id<MTL4CommandBuffer
                 id<MTL4ArgumentTable> argumentTable = ImGui_ImplMetal4_LeaseArgumentTable(ctx, commandBuffer.device);
                 if (argumentTable == nil)
                     continue;
-                ImDrawVert* expanded_vertices = (ImDrawVert*)((char*)vertexBuffer.contents + vertexBufferOffset);
-                const ImDrawVert* source_vertices = draw_list->VtxBuffer.Data;
-                const ImDrawIdx* source_indices = draw_list->IdxBuffer.Data + pcmd->IdxOffset;
-                for (unsigned int idx_n = 0; idx_n < pcmd->ElemCount; idx_n++)
-                    expanded_vertices[idx_n] = source_vertices[source_indices[idx_n]];
-
-                ImGui_ImplMetal4_SetupRenderResources(argumentTable, vertexBuffer, vertexBufferOffset, uniformBuffer);
+                ImGui_ImplMetal4_SetupRenderResources(argumentTable,
+                    vertexBuffer, vertexBufferOffset + pcmd->VtxOffset * sizeof(ImDrawVert),
+                    uniformBuffer,
+                    indexBuffer, indexBufferOffset + pcmd->IdxOffset * sizeof(ImDrawIdx));
 
                 MTLScissorRect scissorRect =
                 {
@@ -692,10 +700,11 @@ void ImGui_ImplMetal4_RenderDrawData(ImDrawData* draw_data, id<MTL4CommandBuffer
                 [commandEncoder drawPrimitives:MTLPrimitiveTypeTriangle
                                    vertexStart:0
                                    vertexCount:pcmd->ElemCount];
-
-                vertexBufferOffset += (size_t)pcmd->ElemCount * sizeof(ImDrawVert);
             }
         }
+
+        vertexBufferOffset += (size_t)draw_list->VtxBuffer.Size * sizeof(ImDrawVert);
+        indexBufferOffset += (size_t)draw_list->IdxBuffer.Size * sizeof(ImDrawIdx);
     }
 }
 #endif
@@ -789,7 +798,7 @@ bool ImGui_ImplMetal_CreateDeviceObjects(id<MTLDevice> device)
     if ([device respondsToSelector:@selector(newArgumentTableWithDescriptor:error:)] && bd->SharedMetalContext.renderArgumentTableDescriptor == nil)
     {
         MTL4ArgumentTableDescriptor* argumentTableDescriptor = [[MTL4ArgumentTableDescriptor alloc] init];
-        argumentTableDescriptor.maxBufferBindCount = 2;
+        argumentTableDescriptor.maxBufferBindCount = 3;
         argumentTableDescriptor.maxTextureBindCount = 1;
         argumentTableDescriptor.supportAttributeStrides = NO;
         argumentTableDescriptor.initializeBindings = YES;
@@ -928,6 +937,9 @@ void ImGui_ImplMetal_DestroyDeviceObjects()
     if ((self = [super init]))
     {
         self.renderPipelineStateCache = [NSMutableDictionary dictionary];
+#if defined(__MAC_26_0) || defined(__IPHONE_26_0)
+        self.metal4RenderPipelineStateCache = [NSMutableDictionary dictionary];
+#endif
         self.bufferCache = [NSMutableArray array];
         _lastBufferCachePurge = GetMachAbsoluteTimeInSeconds();
     }
@@ -1027,23 +1039,22 @@ void ImGui_ImplMetal_DestroyDeviceObjects()
         return nil;
     }
 
+    MTLRenderPipelineDescriptor* pipelineDescriptor = [[MTLRenderPipelineDescriptor alloc] init];
+    pipelineDescriptor.vertexFunction = vertexFunction;
+    pipelineDescriptor.fragmentFunction = fragmentFunction;
     MTLVertexDescriptor* vertexDescriptor = [MTLVertexDescriptor vertexDescriptor];
     vertexDescriptor.attributes[0].offset = offsetof(ImDrawVert, pos);
-    vertexDescriptor.attributes[0].format = MTLVertexFormatFloat2; // position
+    vertexDescriptor.attributes[0].format = MTLVertexFormatFloat2;
     vertexDescriptor.attributes[0].bufferIndex = 0;
     vertexDescriptor.attributes[1].offset = offsetof(ImDrawVert, uv);
-    vertexDescriptor.attributes[1].format = MTLVertexFormatFloat2; // texCoords
+    vertexDescriptor.attributes[1].format = MTLVertexFormatFloat2;
     vertexDescriptor.attributes[1].bufferIndex = 0;
     vertexDescriptor.attributes[2].offset = offsetof(ImDrawVert, col);
-    vertexDescriptor.attributes[2].format = MTLVertexFormatUChar4; // color
+    vertexDescriptor.attributes[2].format = MTLVertexFormatUChar4;
     vertexDescriptor.attributes[2].bufferIndex = 0;
     vertexDescriptor.layouts[0].stepRate = 1;
     vertexDescriptor.layouts[0].stepFunction = MTLVertexStepFunctionPerVertex;
     vertexDescriptor.layouts[0].stride = sizeof(ImDrawVert);
-
-    MTLRenderPipelineDescriptor* pipelineDescriptor = [[MTLRenderPipelineDescriptor alloc] init];
-    pipelineDescriptor.vertexFunction = vertexFunction;
-    pipelineDescriptor.fragmentFunction = fragmentFunction;
     pipelineDescriptor.vertexDescriptor = vertexDescriptor;
     pipelineDescriptor.rasterSampleCount = self.framebufferDescriptor.sampleCount;
     pipelineDescriptor.colorAttachments[0].pixelFormat = self.framebufferDescriptor.colorPixelFormat;
@@ -1063,6 +1074,86 @@ void ImGui_ImplMetal_DestroyDeviceObjects()
 
     return renderPipelineState;
 }
+
+#if defined(__MAC_26_0) || defined(__IPHONE_26_0)
+- (id<MTLRenderPipelineState>)renderPipelineStateForFramebufferDescriptor4:(FramebufferDescriptor*)descriptor device:(id<MTLDevice>)device
+{
+    NSError* error = nil;
+
+    NSString* shaderSource = @""
+    "#include <metal_stdlib>\n"
+    "using namespace metal;\n"
+    "\n"
+    "struct Uniforms {\n"
+    "    float4x4 projectionMatrix;\n"
+    "};\n"
+    "\n"
+    "struct VertexOut {\n"
+    "    float4 position [[position]];\n"
+    "    float2 texCoords;\n"
+    "    float4 color;\n"
+    "};\n"
+    "\n"
+    "vertex VertexOut vertex_main_metal4(uint vertex_id               [[vertex_id]],\n"
+    "                                    constant uchar* vertex_bytes [[buffer(0)]],\n"
+    "                                    constant Uniforms &uniforms  [[buffer(1)]],\n"
+    "                                    constant ushort* indices     [[buffer(2)]]) {\n"
+    "    VertexOut out;\n"
+    "    uint idx = uint(indices[vertex_id]);\n"
+    "    uint byte_offset = idx * 20u;\n"
+    "    float2 position = float2(*((constant packed_float2*)(vertex_bytes + byte_offset + 0u)));\n"
+    "    float2 texCoords = float2(*((constant packed_float2*)(vertex_bytes + byte_offset + 8u)));\n"
+    "    uchar4 color = as_type<uchar4>(*((constant uint*)(vertex_bytes + byte_offset + 16u)));\n"
+    "    out.position = uniforms.projectionMatrix * float4(position, 0, 1);\n"
+    "    out.texCoords = texCoords;\n"
+    "    out.color = float4(color) / float4(255.0);\n"
+    "    return out;\n"
+    "}\n"
+    "\n"
+    "fragment half4 fragment_main_metal4(VertexOut in [[stage_in]],\n"
+    "                                    texture2d<half, access::sample> texture [[texture(0)]]) {\n"
+    "    constexpr sampler linearSampler(coord::normalized, min_filter::linear, mag_filter::linear, mip_filter::linear);\n"
+    "    half4 texColor = texture.sample(linearSampler, in.texCoords);\n"
+    "    return half4(in.color) * texColor;\n"
+    "}\n";
+
+    id<MTLLibrary> library = [device newLibraryWithSource:shaderSource options:nil error:&error];
+    if (library == nil)
+    {
+        NSLog(@"Error: failed to create Metal4 ImGui library: %@", error);
+        return nil;
+    }
+
+    id<MTLFunction> vertexFunction = [library newFunctionWithName:@"vertex_main_metal4"];
+    id<MTLFunction> fragmentFunction = [library newFunctionWithName:@"fragment_main_metal4"];
+    if (vertexFunction == nil || fragmentFunction == nil)
+    {
+        NSLog(@"Error: failed to find Metal4 ImGui shader functions in library: %@", error);
+        return nil;
+    }
+
+    MTLRenderPipelineDescriptor* pipelineDescriptor = [[MTLRenderPipelineDescriptor alloc] init];
+    pipelineDescriptor.vertexFunction = vertexFunction;
+    pipelineDescriptor.fragmentFunction = fragmentFunction;
+    pipelineDescriptor.rasterSampleCount = descriptor.sampleCount;
+    pipelineDescriptor.colorAttachments[0].pixelFormat = descriptor.colorPixelFormat;
+    pipelineDescriptor.colorAttachments[0].blendingEnabled = YES;
+    pipelineDescriptor.colorAttachments[0].rgbBlendOperation = MTLBlendOperationAdd;
+    pipelineDescriptor.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorSourceAlpha;
+    pipelineDescriptor.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+    pipelineDescriptor.colorAttachments[0].alphaBlendOperation = MTLBlendOperationAdd;
+    pipelineDescriptor.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorOne;
+    pipelineDescriptor.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+    pipelineDescriptor.depthAttachmentPixelFormat = descriptor.depthPixelFormat;
+    pipelineDescriptor.stencilAttachmentPixelFormat = descriptor.stencilPixelFormat;
+
+    id<MTLRenderPipelineState> renderPipelineState = [device newRenderPipelineStateWithDescriptor:pipelineDescriptor error:&error];
+    if (error != nil)
+        NSLog(@"Error: failed to create Metal4 ImGui pipeline state: %@", error);
+
+    return renderPipelineState;
+}
+#endif
 
 @end
 
